@@ -475,17 +475,12 @@ class InventoryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class Cart_OrderProductResponse(BaseModel):
+class Cart_Order_Variant_Response(BaseModel):
     id: int
     store_id: int
-    product_name: str
-    primary_image: str
-    product_price: Decimal
-
-    @field_validator("primary_image", mode="before")
-    @classmethod
-    def full_url(cls, value) -> str | None:
-        return get_public_url(value)
+    attributes: dict | Any
+    sku: str
+    price: Decimal
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -747,7 +742,7 @@ class SubCategoryResponse(BaseModel):
 
 class CartItemReponse(BaseModel):
     id: int
-    product: Cart_OrderProductResponse
+    variant: Cart_Order_Variant_Response
     quantity: int
 
     model_config = ConfigDict(from_attributes=True)
@@ -777,7 +772,7 @@ class MemRes(BaseModel):
 
 
 class OrderItemRes(BaseModel):
-    product: Cart_OrderProductResponse
+    variant: Cart_Order_Variant_Response
     quantity: float
     price: Decimal
 
