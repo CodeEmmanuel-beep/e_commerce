@@ -1,7 +1,7 @@
 from app.api.v1.schemas import (
     StandardResponse,
 )
-from fastapi import APIRouter, Query, Request, Depends
+from fastapi import APIRouter, Query, Request, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import cart_service
 from app.database.get import get_db
@@ -19,16 +19,18 @@ DatabaseDep = Annotated[AsyncSession, Depends(get_db)]
 )
 async def add_cartitem(
     store_id: int,
-    product_id: int,
+    variant_id: int,
     request: Request,
     db: DatabaseDep,
+    background_task: BackgroundTasks,
     quantity: int = Query(1, ge=1),
 ):
     return await cart_service.add_item_to_cart(
         store_id=store_id,
-        product_id=product_id,
+        variant_id=variant_id,
         request=request,
         quantity=quantity,
+        background_task=background_task,
         db=db,
     )
 
@@ -95,7 +97,12 @@ async def update__cart(store_id: int, cart_id: int, request: Request, db: Databa
     response_model_exclude_none=True,
 )
 async def delete_one(
-    store_id: int, cart_id: int, cartitem_id: int, request: Request, db: DatabaseDep
+    store_id: int,
+    cart_id: int,
+    cartitem_id: int,
+    request: Request,
+    db: DatabaseDep,
+    background_task: BackgroundTasks,
 ):
     return await cart_service.delete_one(
         cart_id=cart_id,
@@ -103,6 +110,7 @@ async def delete_one(
         cartitem_id=cartitem_id,
         db=db,
         request=request,
+        background_task=background_task,
     )
 
 
@@ -111,7 +119,17 @@ async def delete_one(
     response_model=StandardResponse,
     response_model_exclude_none=True,
 )
-async def delete_cart(store_id: int, cart_id: int, request: Request, db: DatabaseDep):
+async def delete_cart(
+    store_id: int,
+    cart_id: int,
+    request: Request,
+    db: DatabaseDep,
+    background_task: BackgroundTasks,
+):
     return await cart_service.delete_all(
-        cart_id=cart_id, store_id=store_id, request=request, db=db
+        cart_id=cart_id,
+        store_id=store_id,
+        request=request,
+        db=db,
+        background_task=background_task,
     )
