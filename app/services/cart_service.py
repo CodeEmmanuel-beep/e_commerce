@@ -5,7 +5,7 @@ from app.api.v1.schemas import (
     StandardResponse,
     CartItemReponse,
 )
-from app.models import Cart, CartItem, Product, Inventory, Store
+from app.models import Cart, CartItem, Product, Inventory, Store, ProductVariant
 from fastapi import HTTPException
 from app.logs.logger import get_logger
 from sqlalchemy import select, func, delete, exists
@@ -18,11 +18,7 @@ logger = get_logger("cart")
 
 
 async def add_item_to_cart(
-    store_id,
-    request,
-    product_id,
-    quantity,
-    db,
+    store_id, request, variant_id, quantity, db, background_task
 ):
     user_id = unique_id(request)
     if not user_id:
@@ -97,9 +93,9 @@ async def add_item_to_cart(
             await db.rollback()
             raise
     logger.info(
-        "user: '%s' is attempting to add product: '%s' to cart: %s",
+        "user: '%s' is attempting to add product variant: '%s' to cart: %s",
         user_id,
-        product_id,
+        variant_id,
         cart.id,
     )
     available = (
@@ -107,14 +103,17 @@ async def add_item_to_cart(
             select(
                 exists(
                     select(1)
-                    .select_from(Product)
-                    .join(Store, Product.store_id == Store.id)
-                    .join(Inventory, Inventory.product_id == Product.id)
+                    .select_from(ProductVariant)
+                    .join(Product, ProductVariant.product_id == Product.id)
+                    .join(Store, ProductVariant.store_id == Store.id)
+                    .join(Inventory, Inventory.variant_id == ProductVariant.id)
                     .where(
                         Store.id == store_id,
-                        Product.id == product_id,
+                        ProductVariant.id == variant_id,
                         Product.product_availability == "available",
+                        ProductVariant.is_deleted.is_(False),
                         Product.is_deleted.is_(False),
+                        Store.is_deleted.is_(False),
                         Inventory.stock_quantity >= quantity,
                     )
                 )
@@ -123,9 +122,9 @@ async def add_item_to_cart(
     ).scalar()
     if not available:
         logger.warning(
-            "User: '%s' attempted to add product: '%s' to cart: '%s' from store: '%s', but the product is either out of stock, the requested quantity is not available, or the store does not exist",
+            "User: '%s' attempted to add product variant: '%s' to cart: '%s' from store: '%s', but the product is either out of stock, the requested quantity is not available, or the store does not exist",
             user_id,
-            product_id,
+            variant_id,
             cart.id,
             store_id,
         )
@@ -134,7 +133,7 @@ async def add_item_to_cart(
             detail="required quantity not available or product out of stock or store not found",
         )
     cartitem = next(
-        (item for item in cart.cartitems if item.product_id == product_id), None
+        (item for item in cart.cartitems if item.variant_id == variant_id), None
     )
     if not cartitem and len(cart.cartitems) >= 30:
         raise HTTPException(status_code=403, detail="cart full")
@@ -143,28 +142,34 @@ async def add_item_to_cart(
     else:
         items = CartItem(
             cart_id=cart.id,
-            product_id=product_id,
+            variant_id=variant_id,
             quantity=quantity,
         )
         db.add(items)
     cart.total_quantity += quantity
     logger.info(
-        "adding product: '%s' to cart: '%s' for user: %s", product_id, cart.id, user_id
+        "adding product variant: '%s' to cart: '%s' for user: %s",
+        variant_id,
+        cart.id,
+        user_id,
     )
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        logger.error("Database integrity error while adding product to cart")
+        logger.error("Database integrity error while adding product variant to cart")
         raise HTTPException(status_code=400, detail="database error")
     except Exception:
         await db.rollback()
-        logger.exception("error while adding product to cart")
+        logger.exception("error while adding product variant to cart")
         raise HTTPException(status_code=500, detail="internal server error")
     logger.info(
-        "product: %s added to cart: %s for user: %s", product_id, cart.id, user_id
+        "product variant: %s added to cart: %s for user: %s",
+        variant_id,
+        cart.id,
+        user_id,
     )
-    await cart_invalidation(user_id=user_id)
+    background_task.add_task(cart_invalidation, user_id)
     return StandardResponse(
         status="success", message="product added to cart", data=None
     )
@@ -176,7 +181,7 @@ async def retrieve_cart(store_id, request, page, limit, db):
         logger.warning("unauthorized attempt at the retrieve_cart function")
         raise HTTPException(status_code=401, detail="not a registered buyer")
     offset = (page - 1) * limit
-    version = await cache_version("cart_key")
+    version = await cache_version(f"store_cart_key:{store_id}")
     cart_keys = f"carts:v{version}:{user_id}:{store_id}:{page}:{limit}"
     cached_data = await cache(cart_keys)
     if cached_data:
@@ -186,8 +191,8 @@ async def retrieve_cart(store_id, request, page, limit, db):
         select(Cart)
         .options(
             selectinload(Cart.cartitems)
-            .selectinload(CartItem.product)
-            .selectinload(Product.inventory)
+            .selectinload(CartItem.variant)
+            .selectinload(ProductVariant.product)
         )
         .where(
             Cart.user_id == user_id,
@@ -285,8 +290,8 @@ async def update_cart(cart_id, store_id, request, db):
             select(Cart)
             .options(
                 selectinload(Cart.cartitems)
-                .selectinload(CartItem.product)
-                .selectinload(Product.inventory)
+                .selectinload(CartItem.variant)
+                .selectinload(ProductVariant.inventory)
             )
             .where(
                 Cart.user_id == user_id, Cart.store_id == store_id, Cart.id == cart_id
@@ -298,9 +303,9 @@ async def update_cart(cart_id, store_id, request, db):
             raise HTTPException(status_code=404, detail="cart not found")
         remove_items = {}
         for item in result.cartitems:
-            if item.product.is_deleted:
+            if item.variant.is_deleted:
                 remove_items[item.id] = item
-            if item.product.inventory.stock_quantity < item.quantity:
+            if item.variant.inventory.stock_quantity < item.quantity:
                 remove_items[item.id] = item
         if not remove_items:
             return StandardResponse(
@@ -335,6 +340,7 @@ async def delete_one(
     cartitem_id,
     request,
     db,
+    background_task,
 ):
     user_id = unique_id(request)
     if not user_id:
@@ -364,7 +370,6 @@ async def delete_one(
         await db.delete(delete_obj)
         cart.total_quantity -= reduced_quantity
         await db.commit()
-        await cart_invalidation(user_id=user_id)
     except HTTPException:
         await db.rollback()
         raise
@@ -380,6 +385,7 @@ async def delete_one(
             f"error while deleting cart item {cartitem_id} from cart {cart_id} for user {user_id}"
         )
         raise HTTPException(status_code=500, detail="internal server error")
+    background_task.add_task(cart_invalidation, user_id)
     logger.info(
         f"Cart item {cartitem_id} deleted from cart {cart_id} for user {user_id}"
     )
@@ -391,6 +397,7 @@ async def delete_all(
     cart_id,
     request,
     db,
+    background_task,
 ):
     user_id = unique_id(request)
     if not user_id:
@@ -406,7 +413,6 @@ async def delete_all(
     try:
         await db.delete(result)
         await db.commit()
-        await cart_invalidation(user_id=user_id)
     except IntegrityError:
         await db.rollback()
         logger.error(
@@ -417,5 +423,6 @@ async def delete_all(
         await db.rollback()
         logger.exception(f"error while deleting cart {cart_id} for user {user_id}")
         raise HTTPException(status_code=500, detail="internal server error")
+    background_task.add_task(cart_invalidation, user_id)
     logger.info(f"Cart {cart_id} successfully deleted for user {user_id}")
     return StandardResponse(status="success", message="cart emptied", data=None)
