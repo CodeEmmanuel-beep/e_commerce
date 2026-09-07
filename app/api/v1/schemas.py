@@ -249,8 +249,9 @@ class SuperUserResponse(BaseModel):
 class NotificationResponse(BaseModel):
     id: int
     notification: str
-    product_name: str | None = Field(default_factory=str)
     store_name: str | None = Field(default_factory=str)
+    sku: str | None = Field(default_factory=str)
+    product_name: str | None = Field(default_factory=str)
     membership_type: str | None = None
     status: str | None = None
     is_active: bool | None = None
@@ -477,7 +478,6 @@ class InventoryResponse(BaseModel):
 
 class Cart_Order_Variant_Response(BaseModel):
     id: int
-    store_id: int
     attributes: dict | Any
     sku: str
     price: Decimal
@@ -750,6 +750,7 @@ class CartItemReponse(BaseModel):
 
 class CartResponse(BaseModel, Generic[T]):
     id: int
+    store_id: int
     items: list[CartItemReponse] = Field(default_factory=list)
     total_quantity: float
     check_out: bool = Field(default=False)
@@ -781,6 +782,7 @@ class OrderItemRes(BaseModel):
 
 class OrderResponse(BaseModel):
     user: ProfileResponse
+    store_id: int
     id: int
     membership: MemRes | None = None
     tax_rate: float
