@@ -351,6 +351,7 @@ async def run_router():
                                 time_op.replace("Z", "+00:00")
                             ),
                             "product_id": payload.get("product_id"),
+                            "variant_id": payload.get("variant_id"),
                             "store_id": payload.get("store_id"),
                             "status": payload.get("status"),
                             "membership_type": payload.get("type"),
