@@ -1,6 +1,6 @@
 from app.models import (
     Order,
-    Product,
+    ProductVariant,
     OrderItem,
     OrderStatus,
     Membership,
@@ -30,8 +30,11 @@ async def invalidate_order():
                 select(Order)
                 .options(
                     selectinload(Order.orderitems)
-                    .selectinload(OrderItem.product)
-                    .selectinload(Product.inventory)
+                    .selectinload(OrderItem.variant)
+                    .options(
+                        selectinload(ProductVariant.inventory),
+                        selectinload(ProductVariant.product),
+                    )
                 )
                 .where(
                     or_(
