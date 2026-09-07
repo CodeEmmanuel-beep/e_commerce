@@ -237,11 +237,11 @@ def store_inventory(store_id, inventory_id: int | None = None):
 
 def restore_inventory(order):
     for orderitems in order.orderitems:
-        if orderitems.product and orderitems.product.inventory:
-            stock = orderitems.product.inventory
+        if orderitems.variant and orderitems.variant.inventory:
+            stock = orderitems.variant.inventory
             stock.stock_quantity += orderitems.quantity
-            if orderitems.product.product_availability == "out_of_stock":
-                orderitems.product.product_availability = "available"
+            if orderitems.variant.product.product_availability == "out_of_stock":
+                orderitems.variant.product.product_availability = "available"
 
 
 async def view_performance_helper(
