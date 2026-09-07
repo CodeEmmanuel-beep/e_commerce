@@ -2,7 +2,6 @@ from app.api.v1.schemas import (
     OrderResponse,
     PaginatedMetadata,
     StandardResponse,
-    OrderItemRes,
 )
 from app.models import OrderStatus
 from fastapi import APIRouter, Query, BackgroundTasks, Request, Depends
@@ -133,9 +132,19 @@ async def view_order(
 
 
 @router.put("/re-order/{store_id}/{order_id}")
-async def re_order(request: Request, store_id: int, order_id: int, db: DatabaseDep):
+async def re_order(
+    request: Request,
+    store_id: int,
+    order_id: int,
+    db: DatabaseDep,
+    background_task: BackgroundTasks,
+):
     return await order_service.reactivate_order(
-        store_id=store_id, order_id=order_id, db=db, request=request
+        store_id=store_id,
+        order_id=order_id,
+        db=db,
+        request=request,
+        background_task=background_task,
     )
 
 
@@ -176,9 +185,19 @@ async def update_order_status(
     response_model=StandardResponse,
     response_model_exclude_none=True,
 )
-async def cancel(request: Request, store_id: int, order_id: int, db: DatabaseDep):
+async def cancel(
+    request: Request,
+    store_id: int,
+    order_id: int,
+    db: DatabaseDep,
+    background_task: BackgroundTasks,
+):
     return await order_service.cancel_order(
-        store_id=store_id, order_id=order_id, db=db, request=request
+        store_id=store_id,
+        order_id=order_id,
+        db=db,
+        request=request,
+        background_task=background_task,
     )
 
 
@@ -187,7 +206,17 @@ async def cancel(request: Request, store_id: int, order_id: int, db: DatabaseDep
     response_model=StandardResponse,
     response_model_exclude_none=True,
 )
-async def delete_order(request: Request, store_id: int, order_id: int, db: DatabaseDep):
+async def delete_order(
+    request: Request,
+    store_id: int,
+    order_id: int,
+    db: DatabaseDep,
+    background_task: BackgroundTasks,
+):
     return await order_service.delete_order(
-        store_id=store_id, order_id=order_id, db=db, request=request
+        store_id=store_id,
+        order_id=order_id,
+        db=db,
+        request=request,
+        background_task=background_task,
     )
