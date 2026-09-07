@@ -363,15 +363,15 @@ async def stripe_webhook(request, background_task):
                     .values(**update_values)
                     .returning(Subscription.membership_id)
                 )
-                returned_id = idem.scalar()
-                if not returned_id:
+                returned_ids = idem.scalars().all()
+                if not returned_ids:
                     logger.info(
                         f"Subscription {membership_id} of event_id: {event['id']} already processed. Skipping."
                     )
                     return {"status": "success", "message": "already processed"}
                 idempo = await db.execute(
                     update(Membership)
-                    .where(Membership.id == returned_id)
+                    .where(Membership.id.in_(returned_ids))
                     .values(is_active=membership_status_case)
                 )
             else:
@@ -441,16 +441,16 @@ async def stripe_webhook(request, background_task):
                     )
                     .returning(Payment.order_id)
                 )
-                row = idemp.scalar()
-                if not row:
+                rows = idemp.scalars().all()
+                if not rows:
                     logger.info(
                         f"Payment {stripe_session_id} already processed. Skipping."
                     )
                     return {"status": "success", "message": "already processed"}
                 await db.execute(
                     update(Order)
-                    .where(Order.id == row)
-                    .values(status=order_status)
+                    .where(Order.id.in_(rows))
+                    .values(status=order_status, reference_id=actual_transaction_id)
                     .returning(Order.id)
                 )
         elif is_order_refund:
