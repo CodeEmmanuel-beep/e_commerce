@@ -17,6 +17,8 @@ from app.models import (
     OrderStatus,
     Membership,
     Payment,
+    ProductVariant,
+    PaymentStatus,
 )
 from datetime import datetime, timezone, timedelta
 from fastapi import HTTPException
@@ -33,7 +35,6 @@ from app.utils.redis import (
 )
 from app.utils.helper import restore_inventory, unique_id, store_auth
 from decimal import Decimal
-import asyncio
 
 logger = get_logger("order")
 
@@ -95,10 +96,6 @@ DISCOUNT_MAP = {
 TWO_PLACES = Decimal("0.01")
 
 
-async def invalidate_cache(user_id):
-    return await asyncio.gather(cart_invalidation(user_id))
-
-
 async def create_orders(store_id, cart_id, db, request, background_task):
     user_id = unique_id(request)
     if not user_id:
@@ -112,8 +109,8 @@ async def create_orders(store_id, cart_id, db, request, background_task):
             .options(
                 joinedload(Cart.store),
                 selectinload(Cart.cartitems)
-                .selectinload(CartItem.product)
-                .selectinload(Product.inventory),
+                .selectinload(CartItem.variant)
+                .selectinload(ProductVariant.product),
             )
             .where(
                 Cart.id == cart_id,
@@ -155,13 +152,13 @@ async def create_orders(store_id, cart_id, db, request, background_task):
         if not order.id:
             logger.warning("No order created")
             raise HTTPException(status_code=404, detail="no order created")
-        product_ids = sorted([items.product_id for items in cart.cartitems])
+        variant_ids = sorted([items.variant_id for items in cart.cartitems])
         inventory = (
             (
                 await db.execute(
                     select(Inventory)
                     .where(
-                        Inventory.product_id.in_(product_ids),
+                        Inventory.variant_id.in_(variant_ids),
                         Inventory.is_deleted.is_(False),
                     )
                     .with_for_update(),
@@ -170,20 +167,20 @@ async def create_orders(store_id, cart_id, db, request, background_task):
             .scalars()
             .all()
         )
-        cart_product_ids = {i.product_id for i in cart.cartitems}
-        inventory_product_ids = {inv.product_id for inv in inventory}
-        if cart_product_ids != inventory_product_ids:
+        cart_variant_ids = {i.variant_id for i in cart.cartitems}
+        inventory_variant_ids = {inv.variant_id for inv in inventory}
+        if cart_variant_ids != inventory_variant_ids:
             logger.warning(
                 "inventory mismatch at create_order_items endpoint",
             )
             raise HTTPException(404, "inventory mismatch")
-        inventory_map = {inv.product_id: inv for inv in inventory}
+        inventory_map = {inv.variant_id: inv for inv in inventory}
         items = [
             i
             for i in cart.cartitems
-            if i.product.is_deleted
-            or i.product.product_availability != "available"
-            or i.quantity > inventory_map[i.product_id].stock_quantity
+            if i.variant.is_deleted
+            or i.quantity > inventory_map[i.variant_id].stock_quantity
+            or i.variant.product.product_availability != "available"
         ]
         if items:
             raise HTTPException(
@@ -193,27 +190,60 @@ async def create_orders(store_id, cart_id, db, request, background_task):
         new_orderitems = []
         total_quantity = 0
         subtotal = Decimal("0.00")
+        product_to_check = set()
         for cartitem in cart.cartitems:
-            product = cartitem.product
-            price = (
-                cartitem.product.product_price * Decimal(str(cartitem.quantity))
-            ).quantize(TWO_PLACES)
+            variant = cartitem.variant
+            price = (cartitem.variant.price * Decimal(str(cartitem.quantity))).quantize(
+                TWO_PLACES
+            )
             new_orderitems.append(
                 OrderItem(
                     order_id=order.id,
-                    product_id=cartitem.product_id,
+                    variant_id=cartitem.variant_id,
                     quantity=cartitem.quantity,
                     price=price,
                 )
             )
-            target_inventory = inventory_map[cartitem.product_id]
+            target_inventory = inventory_map[cartitem.variant_id]
             target_inventory.stock_quantity = max(
                 target_inventory.stock_quantity - cartitem.quantity, 0
             )
             total_quantity += cartitem.quantity
             subtotal += price
             if target_inventory.stock_quantity == 0:
-                product.product_availability = "out_of_stock"
+                await db.flush()
+                product_to_check.add(variant.product_id)
+        logger.info(f"product to check: {product_to_check}")
+        if product_to_check:
+            remaining_stock = (
+                (
+                    await db.execute(
+                        select(ProductVariant.product_id)
+                        .join(
+                            Inventory,
+                            ProductVariant.id == Inventory.variant_id,
+                        )
+                        .where(
+                            ProductVariant.product_id.in_(product_to_check),
+                            ProductVariant.is_deleted.is_(False),
+                            Inventory.is_deleted.is_(False),
+                            Inventory.stock_quantity > 0,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            out_of_stock_products = product_to_check - set(remaining_stock)
+            logger.info(f"out of stock; {out_of_stock_products}")
+            if out_of_stock_products:
+                (
+                    await db.execute(
+                        update(Product)
+                        .where(Product.id.in_(out_of_stock_products))
+                        .values(product_availability="out_of_stock")
+                    )
+                )
         order.total_quantity = total_quantity
         order.subtotal = subtotal.quantize(TWO_PLACES)
         order.discount_amount = Decimal("0.00")
@@ -259,7 +289,7 @@ async def create_orders(store_id, cart_id, db, request, background_task):
         await db.rollback()
         logger.exception("error while creating order items")
         raise HTTPException(status_code=500, detail="internal server error")
-    background_task.add_task(invalidate_cache, user_id)
+    background_task.add_task(cart_invalidation, user_id)
     background_task.add_task(order_global_invalidation, store_id)
     logger.info("order items created successfully for order_id: %s", order_id)
     return StandardResponse(
@@ -320,8 +350,8 @@ async def view_orders(store_id, page, limit, db, request):
         select(Order)
         .options(
             selectinload(Order.orderitems)
-            .selectinload(OrderItem.product)
-            .selectinload(Product.inventory),
+            .selectinload(OrderItem.variant)
+            .selectinload(ProductVariant.inventory),
             selectinload(Order.membership),
             selectinload(Order.user),
         )
@@ -363,8 +393,8 @@ async def view_store_orders(store_id, limit, status, cursor_id, db, request):
         select(Order)
         .options(
             selectinload(Order.orderitems)
-            .selectinload(OrderItem.product)
-            .selectinload(Product.inventory),
+            .selectinload(OrderItem.variant)
+            .selectinload(ProductVariant.inventory),
             selectinload(Order.membership),
             selectinload(Order.user),
         )
@@ -419,8 +449,8 @@ async def view_store_order(store_id, order_id, page, limit, db, request):
         select(Order)
         .options(
             selectinload(Order.orderitems)
-            .selectinload(OrderItem.product)
-            .selectinload(Product.inventory),
+            .selectinload(OrderItem.variant)
+            .selectinload(ProductVariant.inventory),
             selectinload(Order.payment),
             selectinload(Order.user),
             selectinload(Order.membership),
@@ -477,8 +507,8 @@ async def view_order(store_id, order_id, page, limit, db, request):
         select(Order)
         .options(
             selectinload(Order.orderitems)
-            .selectinload(OrderItem.product)
-            .selectinload(Product.inventory),
+            .selectinload(OrderItem.variant)
+            .selectinload(ProductVariant.inventory),
             selectinload(Order.payment),
             selectinload(Order.user),
             selectinload(Order.membership),
@@ -516,7 +546,7 @@ async def view_order(store_id, order_id, page, limit, db, request):
     return full_response
 
 
-async def reactivate_order(store_id, order_id, db, request):
+async def reactivate_order(store_id, order_id, db, request, background_task):
     user_id = unique_id(request)
     if not user_id:
         logger.warning("unauthorized attempt at checkout endpoint")
@@ -527,8 +557,8 @@ async def reactivate_order(store_id, order_id, db, request):
             .options(
                 joinedload(Order.store),
                 selectinload(Order.orderitems)
-                .selectinload(OrderItem.product)
-                .selectinload(Product.inventory),
+                .selectinload(OrderItem.variant)
+                .selectinload(ProductVariant.product),
             )
             .where(
                 Order.user_id == user_id,
@@ -549,13 +579,13 @@ async def reactivate_order(store_id, order_id, db, request):
         if not order.orderitems:
             logger.warning("order: '%s' was created without orderitems", order_id)
             raise HTTPException(status_code=400, detail="order contains no items")
-        product_ids = sorted([item.product_id for item in order.orderitems])
+        variant_ids = sorted([item.variant_id for item in order.orderitems])
         inventory = (
             (
                 await db.execute(
                     select(Inventory)
                     .where(
-                        Inventory.product_id.in_(product_ids),
+                        Inventory.variant_id.in_(variant_ids),
                         Inventory.is_deleted.is_(False),
                     )
                     .with_for_update(),
@@ -564,11 +594,11 @@ async def reactivate_order(store_id, order_id, db, request):
             .scalars()
             .all()
         )
-        order_product_ids = {item.product_id for item in order.orderitems}
-        inventory_product_ids = {inv.product_id for inv in inventory}
-        if order_product_ids != inventory_product_ids:
+        order_variant_ids = {item.variant_id for item in order.orderitems}
+        inventory_variant_ids = {inv.variant_id for inv in inventory}
+        if order_variant_ids != inventory_variant_ids:
             logger.warning(
-                "user: '%s', reactivation failed. Some products are no longer available in catalog",
+                "user: '%s', reactivation failed. Some product variants are no longer available in catalog",
                 user_id,
             )
             raise HTTPException(
@@ -583,25 +613,25 @@ async def reactivate_order(store_id, order_id, db, request):
         membership_result = await db.execute(membership_stmt)
         membership = membership_result.scalar_one_or_none()
         has_premium = membership and membership.membership_type == "Premium"
-        inventory_map = {inv.product_id: inv for inv in inventory}
+        inventory_map = {inv.variant_id: inv for inv in inventory}
         failed_item = None
         for item in order.orderitems:
             if (
-                inventory_map[item.product_id].stock_quantity < item.quantity
-                or item.product.is_deleted
-                or item.product.product_availability != "available"
+                inventory_map[item.variant_id].stock_quantity < item.quantity
+                or item.variant.is_deleted
+                or item.variant.product.product_availability != "available"
             ):
                 failed_item = item
                 break
         if failed_item:
-            product = failed_item.product
-            available_inventory = inventory_map[failed_item.product_id].stock_quantity
+            variant = failed_item.variant
+            available_inventory = inventory_map[failed_item.variant_id].stock_quantity
             reason = None
             if available_inventory < failed_item.quantity:
                 reason = "insufficient stock"
-            elif product.is_deleted:
+            elif variant.is_deleted:
                 reason = "product deleted"
-            elif product.product_availability != "available":
+            elif variant.product.product_availability != "available":
                 reason = "product unavailable"
             logger.warning("user '%s' reactivation failed, reason: %s", user_id, reason)
             raise HTTPException(status_code=400, detail=reason)
@@ -610,17 +640,48 @@ async def reactivate_order(store_id, order_id, db, request):
         tax_rate = order.store.tax_rate
         shipping_fee = Decimal("0.00") if has_premium else order.store.shipping_fee
         order.re_order_time = datetime.now(timezone.utc)
+        product_to_check = set()
         for orderitems in order.orderitems:
-            product = orderitems.product
-            current_item_price = product.product_price * Decimal(
+            product_variant = orderitems.variant
+            current_item_price = product_variant.price * Decimal(
                 str(orderitems.quantity)
             )
             orderitems.price = current_item_price
             new_subtotal += current_item_price
-            target_inventory = inventory_map[orderitems.product_id]
+            target_inventory = inventory_map[orderitems.variant_id]
             target_inventory.stock_quantity -= orderitems.quantity
             if target_inventory.stock_quantity == 0:
-                product.product_availability = "out_of_stock"
+                product_to_check.add(product_variant.product_id)
+                await db.flush()
+        if product_to_check:
+            remaining_stock = (
+                (
+                    await db.execute(
+                        select(ProductVariant.product_id)
+                        .join(
+                            Inventory,
+                            ProductVariant.id == Inventory.variant_id,
+                        )
+                        .where(
+                            ProductVariant.product_id.in_(product_to_check),
+                            ProductVariant.is_deleted.is_(False),
+                            Inventory.is_deleted.is_(False),
+                            Inventory.stock_quantity > 0,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            out_of_stock_products = product_to_check - set(remaining_stock)
+            if out_of_stock_products:
+                (
+                    await db.execute(
+                        update(Product)
+                        .where(Product.id.in_(out_of_stock_products))
+                        .values(product_availability="out_of_stock")
+                    )
+                )
         tax_amount = (new_subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(
             TWO_PLACES
         )
@@ -648,7 +709,7 @@ async def reactivate_order(store_id, order_id, db, request):
         await db.rollback()
         logger.exception("error at re-order endpoint")
         raise HTTPException(status_code=500, detail="internal server error")
-    await order_global_invalidation(store_id)
+    background_task.add_task(order_global_invalidation, store_id)
     logger.info("Order: '%s' successfully re-ordered", order_id)
     return StandardResponse(
         status="success",
@@ -662,81 +723,90 @@ async def proceed_to_payment_portal(store_id, order_id, db, request):
     if not user_id:
         logger.warning("Unauthorized access attempt for order_id=%s", order_id)
         raise HTTPException(status_code=401, detail="unauthorized access")
-    checkout = (
-        await db.execute(
-            select(Order)
-            .options(
-                selectinload(Order.address),
-                selectinload(Order.orderitems)
-                .selectinload(OrderItem.product)
-                .selectinload(Product.inventory),
-            )
-            .where(
-                Order.user_id == user_id,
-                Order.order_delete.is_(False),
-                Order.id == order_id,
-                Order.store_id == store_id,
-                Order.status == OrderStatus.pending,
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if not checkout:
-        logger.warning(
-            "user: %s attempted payment for non-existent or invalid order %s",
-            user_id,
-            order_id,
-        )
-        raise HTTPException(
-            status_code=404,
-            detail="order not found, if you think this is a mistake try again shortly",
-        )
-    now = datetime.now(timezone.utc)
-    retry_limit = now - timedelta(minutes=30)
-    time_limit = now - timedelta(hours=1)
-    is_expired = False
-    if checkout.re_order_time and checkout.re_order_time <= retry_limit:
-        checkout.order_delete = True
-        is_expired = True
-    elif not checkout.re_order_time and checkout.created_at <= time_limit:
-        is_expired = True
-    if is_expired:
-        try:
-            checkout.status = OrderStatus.cancelled
-            if checkout.orderitems:
-                restore_inventory(checkout)
-            await db.commit()
-        except IntegrityError:
-            await db.rollback()
-            logger.error("Database integrity error while  updating checked out order")
-            raise HTTPException(status_code=400, detail="database integrity error")
-        except Exception:
-            await db.rollback()
-            logger.exception("error while updating checked out order")
-            raise HTTPException(status_code=500, detail="internal server error")
-        raise HTTPException(
-            status_code=409, detail="Order session expired. Please re-initiate order"
-        )
-    checkout_addr = (
-        checkout.address
-        if checkout.address and not checkout.address.is_deleted
-        else None
-    )
-    if not checkout_addr:
-        logger.warning(
-            "user: %s attempted payment for order %s without delivery address",
-            user_id,
-            order_id,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail="Delivery address required before proceeding to payment",
-        )
-    added_twenty = timedelta(minutes=5)
-    if checkout.re_order_time:
-        checkout.re_order_time += added_twenty
     try:
+        checkout = (
+            await db.execute(
+                select(Order)
+                .options(
+                    selectinload(Order.address),
+                    selectinload(Order.orderitems)
+                    .selectinload(OrderItem.variant)
+                    .options(
+                        selectinload(ProductVariant.inventory),
+                        selectinload(ProductVariant.product),
+                    ),
+                )
+                .where(
+                    Order.user_id == user_id,
+                    Order.order_delete.is_(False),
+                    Order.id == order_id,
+                    Order.store_id == store_id,
+                    Order.status == OrderStatus.pending,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if not checkout:
+            logger.warning(
+                "user: %s attempted payment for non-existent or invalid order %s",
+                user_id,
+                order_id,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="order not found, if you think this is a mistake try again shortly",
+            )
+        now = datetime.now(timezone.utc)
+        retry_limit = now - timedelta(minutes=30)
+        time_limit = now - timedelta(hours=1)
+        is_expired = False
+        if checkout.re_order_time and checkout.re_order_time <= retry_limit:
+            checkout.order_delete = True
+            is_expired = True
+        elif not checkout.re_order_time and checkout.created_at <= time_limit:
+            is_expired = True
+        if is_expired:
+            try:
+                checkout.status = OrderStatus.cancelled
+                if checkout.orderitems:
+                    restore_inventory(checkout)
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+                logger.error(
+                    "Database integrity error while  updating checked out order"
+                )
+                raise HTTPException(status_code=400, detail="database integrity error")
+            except Exception:
+                await db.rollback()
+                logger.exception("error while updating checked out order")
+                raise HTTPException(status_code=500, detail="internal server error")
+            raise HTTPException(
+                status_code=409,
+                detail="Order session expired. Please re-initiate order",
+            )
+        checkout_addr = (
+            checkout.address
+            if checkout.address and not checkout.address.is_deleted
+            else None
+        )
+        if not checkout_addr:
+            logger.warning(
+                "user: %s attempted payment for order %s without delivery address",
+                user_id,
+                order_id,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Delivery address required before proceeding to payment",
+            )
+        buffer_time = timedelta(minutes=5)
+        if checkout.re_order_time:
+            checkout.re_order_time += buffer_time
         await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception:
         await db.rollback()
         logger.exception(
@@ -763,8 +833,11 @@ async def toggle_status(store_id, order_id, request, background_task, status, db
             .options(
                 selectinload(Order.payment).selectinload(Payment.refunds),
                 selectinload(Order.orderitems)
-                .selectinload(OrderItem.product)
-                .selectinload(Product.inventory),
+                .selectinload(OrderItem.variant)
+                .options(
+                    selectinload(ProductVariant.inventory),
+                    selectinload(ProductVariant.product),
+                ),
             )
             .where(
                 Order.id == order_id,
@@ -799,6 +872,25 @@ async def toggle_status(store_id, order_id, request, background_task, status, db
                     status_code=400,
                     detail="you need to fully refund customer before you cancel or revert order to pending",
                 )
+        if order.status == OrderStatus.pending:
+            if (
+                not order.payment
+                or order.payment.payment_status != PaymentStatus.SUCCESS.value
+            ):
+                if new_status in [
+                    OrderStatus.shipped,
+                    OrderStatus.processing,
+                    OrderStatus.delivered,
+                ]:
+                    logger.warning(
+                        "User: %s attempted to progress status for order %s without successful payment",
+                        user_id,
+                        order_id,
+                    )
+                    raise HTTPException(
+                        status_code=400,
+                        detail="you cannot progress order status to shipped, processing or delivered when the order is not paid for",
+                    )
         order.status = new_status
         if new_status == OrderStatus.cancelled:
             restore_inventory(order)
@@ -828,57 +920,57 @@ async def toggle_status(store_id, order_id, request, background_task, status, db
     )
 
 
-async def cancel_order(
-    store_id,
-    order_id,
-    db,
-    request,
-):
+async def cancel_order(store_id, order_id, db, request, background_task):
     user_id = unique_id(request)
     if not user_id:
         logger.error("Unauthorized attempt to cancel order")
         raise HTTPException(status_code=401, detail="not authorized")
-    stmt = (
-        select(Order)
-        .options(
-            selectinload(Order.payment),
-            selectinload(Order.orderitems)
-            .selectinload(OrderItem.product)
-            .selectinload(Product.inventory),
-        )
-        .where(
-            Order.user_id == user_id,
-            Order.store_id == store_id,
-            Order.id == order_id,
-            Order.order_delete.is_(False),
-            Order.status.in_([OrderStatus.pending, OrderStatus.cancelled]),
-        )
-        .with_for_update(of=Order)
-    )
-    logger.info("fetching order to cancel for order_id: %s", order_id)
-    result = (await db.execute(stmt)).scalar_one_or_none()
-    if not result:
-        logger.error("Order with order_id: '%s' not found for cancellation", order_id)
-        raise HTTPException(status_code=404, detail="order not found")
-    payment_status = result.payment.payment_status if result.payment else "pending"
-    if payment_status == "pending":
-        if result.status == OrderStatus.cancelled:
-            return StandardResponse(
-                status="success", message="order already cancelled", data=None
-            )
-        result.status = OrderStatus.cancelled
-        if result.orderitems:
-            restore_inventory(result)
-        logger.info("Order with order_id: '%s' cancelled successfully", order_id)
-    else:
-        logger.error(
-            "Order with order_id: '%s' cannot be cancelled, payment triggered", order_id
-        )
-        raise HTTPException(
-            status_code=400, detail="payment is triggered, cannot cancel order"
-        )
     try:
+        stmt = (
+            select(Order)
+            .options(
+                selectinload(Order.payment),
+                selectinload(Order.orderitems)
+                .selectinload(OrderItem.variant)
+                .options(
+                    selectinload(ProductVariant.inventory),
+                    selectinload(ProductVariant.product),
+                ),
+            )
+            .where(
+                Order.user_id == user_id,
+                Order.store_id == store_id,
+                Order.id == order_id,
+                Order.order_delete.is_(False),
+                Order.status == OrderStatus.pending,
+            )
+            .with_for_update(of=Order)
+        )
+        logger.info("fetching order to cancel for order_id: %s", order_id)
+        result = (await db.execute(stmt)).scalar_one_or_none()
+        if not result:
+            logger.error(
+                "Order with order_id: '%s' not found for cancellation", order_id
+            )
+            raise HTTPException(status_code=404, detail="order not found")
+        payment_status = result.payment.payment_status if result.payment else "pending"
+        if payment_status == "pending":
+            result.status = OrderStatus.cancelled
+            if result.orderitems:
+                restore_inventory(result)
+            logger.info("Order with order_id: '%s' cancelled successfully", order_id)
+        else:
+            logger.error(
+                "Order with order_id: '%s' cannot be cancelled, payment triggered",
+                order_id,
+            )
+            raise HTTPException(
+                status_code=400, detail="payment is triggered, cannot cancel order"
+            )
         await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
     except IntegrityError:
         await db.rollback()
         logger.error("Database integrity error while cancelling order")
@@ -887,43 +979,46 @@ async def cancel_order(
         await db.rollback()
         logger.exception("error while cancelling order")
         raise HTTPException(status_code=500, detail="internal server error")
-    await order_global_invalidation(store_id)
+    background_task.add_task(order_global_invalidation, store_id)
     logger.info("Order cancellation process completed for order_id: %s", order_id)
     return StandardResponse(status="success", message="order cancelled", data=None)
 
 
-async def delete_order(store_id, order_id, db, request):
+async def delete_order(store_id, order_id, db, request, background_task):
     user_id = unique_id(request)
     if not user_id:
         logger.error("Unauthorized attempt to delete order")
         raise HTTPException(status_code=401, detail="not authorized")
-    stmt = (
-        select(Order)
-        .where(
-            Order.user_id == user_id,
-            Order.order_delete.is_(False),
-            Order.store_id == store_id,
-            Order.id == order_id,
-        )
-        .with_for_update()
-    )
-    result = (await db.execute(stmt)).scalar_one_or_none()
-    logger.info(f"Fetching order to delete for order_id: {order_id}")
-    if not result:
-        logger.error(f"Order with order_id: {order_id} not found for deletion")
-        raise HTTPException(status_code=404, detail="order not found")
-    if result.status not in [
-        OrderStatus.cancelled,
-        OrderStatus.delivered,
-        OrderStatus.shipped,
-    ]:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot delete an active order. Please cancel it first.",
-        )
-    result.order_delete = True
     try:
+        logger.info("Fetching order to delete for order_id: %s", order_id)
+        stmt = (
+            select(Order)
+            .where(
+                Order.user_id == user_id,
+                Order.order_delete.is_(False),
+                Order.store_id == store_id,
+                Order.id == order_id,
+            )
+            .with_for_update()
+        )
+        result = (await db.execute(stmt)).scalar_one_or_none()
+        if not result:
+            logger.error("Order with order_id: '%s' not found for deletion", order_id)
+            raise HTTPException(status_code=404, detail="order not found")
+        if result.status not in [
+            OrderStatus.cancelled,
+            OrderStatus.delivered,
+            OrderStatus.shipped,
+        ]:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete an active order. Please cancel it first.",
+            )
+        result.order_delete = True
         await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
     except IntegrityError:
         await db.rollback()
         logger.error("Database integrity error while deleting order")
@@ -932,6 +1027,6 @@ async def delete_order(store_id, order_id, db, request):
         await db.rollback()
         logger.exception("error while deleting order")
         raise HTTPException(status_code=500, detail="internal server error")
-    await order_global_invalidation(store_id)
-    logger.info(f"Order deletion process completed for order_id: {order_id}")
+    background_task.add_task(order_global_invalidation, store_id)
+    logger.info("Order deletion process completed for order_id: %s", order_id)
     return StandardResponse(status="success", message="order deleted", data=None)
