@@ -46,9 +46,11 @@ async def retrieve_notifications(
     notifier = (
         await db.execute(
             select(Notification, User)
-            .join(User, Notification.from_user == User.id)
+            .outerjoin(User, Notification.from_user == User.id)
             .options(
-                selectinload(Notification.product), selectinload(Notification.store)
+                selectinload(Notification.product),
+                selectinload(Notification.productvariant),
+                selectinload(Notification.store),
             )
             .where(Notification.notified_user == user_id)
             .order_by(Notification.created_at.desc())
@@ -69,6 +71,12 @@ async def retrieve_notifications(
                 if notify.product.id == notify.product_id
                 else None
             )
+        if notify.variant_id:
+            data.sku = (
+                notify.productvariant.sku
+                if notify.productvariant.id == notify.variant_id
+                else None
+            )
         data.store_name = (
             notify.store.store_name if notify.store.id == notify.store_id else None
         )
@@ -78,6 +86,8 @@ async def retrieve_notifications(
                 if sender.is_active
                 else f"{notify.notification} by deleted user"
             )
+        elif notify.notification.startswith("you"):
+            data.notification = notify.notification
         else:
             data.notification = (
                 f"{notify.notification} by {sender.first_name} {sender.surname}"
@@ -111,9 +121,11 @@ async def notifications_list(page, limit, db, request):
     notifier = (
         await db.execute(
             select(Notification, User)
-            .join(User, Notification.from_user == User.id)
+            .outerjoin(User, Notification.from_user == User.id)
             .options(
-                selectinload(Notification.product), selectinload(Notification.store)
+                selectinload(Notification.product),
+                selectinload(Notification.productvariant),
+                selectinload(Notification.store),
             )
             .where(Notification.notified_user == user_id)
             .order_by(Notification.created_at.desc())
@@ -143,6 +155,12 @@ async def notifications_list(page, limit, db, request):
                 if notify.product.id == notify.product_id
                 else None
             )
+        if notify.variant_id:
+            data.sku = (
+                notify.productvariant.sku
+                if notify.productvariant.id == notify.variant_id
+                else None
+            )
         data.store_name = (
             notify.store.store_name if notify.store.id == notify.store_id else None
         )
@@ -152,6 +170,8 @@ async def notifications_list(page, limit, db, request):
                 if sender.is_active
                 else f"{notify.notification} by deleted user"
             )
+        elif notify.notification.startswith("you"):
+            data.notification = notify.notification
         else:
             data.notification = (
                 f"{notify.notification} by {sender.first_name} {sender.surname}"
